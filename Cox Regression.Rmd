@@ -1,0 +1,136 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+```{r}
+library(survival)
+library(stats)
+library(gridExtra)
+library(broom)
+library(tidyr)
+library(stringr)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(ggpubr)
+library(survminer)
+library(openxlsx)
+```
+```{r}
+#Load in data/initial cleaning
+getwd()
+setwd("/Users/rajva/OneDrive - The Mount Sinai Hospital/Huang_lab/manuscripts/ADRiskPrediction/data/sema4_data/")
+data = read.csv("cox_regression_data_sema4.csv")
+
+# Filter for variants with more than 20 carriers
+filtered_data <- data %>%
+  group_by(Variant) %>%
+  filter(sum(Genotype %in% c("0/1", "1/1"), na.rm = TRUE) >= 10)
+
+#Combine genotype data into 0 or 1 depending on if patient is carrier or not
+filtered_data$carrier = ifelse(filtered_data$Genotype == "0/0", 0, 1)
+```
+```{r}
+# Function to extract hazard ratio and confidence interval for carrier status
+extract_hr_ci <- function(variant) {
+  variant_data <- filtered_data %>% filter(Variant == variant)
+  surv_obj = Surv(time = variant_data$AGE_OF_ENTRY, event = variant_data$dementia_present)
+  fit = coxph(surv_obj ~ carrier + GENDER + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC8 + PC9 + PC10,  data = variant_data)
+  summary <- summary(fit)
+  
+  hr <- summary$conf.int["carrier", "exp(coef)"]
+  lower_ci <- summary$conf.int["carrier", "lower .95"]
+  upper_ci <- summary$conf.int["carrier", "upper .95"]
+  p_value <- summary$coefficients["carrier", "Pr(>|z|)"]
+  
+  return(c(variant = variant, hr = hr, lower_ci = lower_ci, upper_ci = upper_ci, p_value = p_value))
+}
+
+# Apply the function to all variants
+results <- lapply(unique(filtered_data$Variant), extract_hr_ci)
+results_df <- do.call(rbind, results) %>% as.data.frame()
+
+# Convert character columns to numeric
+results_df[, 2:5] <- lapply(results_df[, 2:5], as.numeric)
+
+# Remove variants with infinite confidence intervals
+results_df <- results_df %>% 
+  filter(!is.infinite(lower_ci) & !is.infinite(upper_ci))
+
+# Calculate rounded hazard ratio labels
+results_df$hr_label <- round(results_df$hr, 2)
+
+# Order results by hazard ratio
+results_df <- results_df %>% 
+  arrange(desc(hr)) %>%
+  mutate(variant = factor(variant, levels = variant))
+
+#Adjust for FDR
+results_df$adjust_p_value = p.adjust(results_df$p_value, method = "fdr")
+```
+```{r}
+# Prepare data for plotting
+results_df <- results_df %>%
+  mutate(
+    upper_ci_plot = pmin(upper_ci, cap_limit),
+    lower_ci_plot = pmax(lower_ci, 0.1),
+    clipped = upper_ci > cap_limit,
+    is_significant = adjust_p_value < 0.05,
+    hr_label = ifelse(clipped, paste0(hr_label, "*"), hr_label),
+    label_color = ifelse(is_significant, "red", "black")
+  )
+
+# Base plot with CI lines and points
+forest_plot <- ggplot(results_df, aes(y = variant, x = hr)) +
+  geom_errorbarh(aes(xmin = lower_ci_plot, xmax = upper_ci_plot), height = 0.2) +
+  geom_point(aes(color = is_significant), size = 3) +
+  scale_color_manual(values = c("black", "red"), guide = "none") +
+
+  # Add HR labels:
+  # (1) non-clipped: at end of CI
+  geom_text(
+    data = results_df %>% filter(!clipped),
+    aes(x = upper_ci_plot, label = hr_label, color = is_significant),
+    hjust = -0.1, size = 3, show.legend = FALSE
+  ) +
+  # (2) clipped: above dot
+  geom_text(
+    data = results_df %>% filter(clipped),
+    aes(x = hr, label = hr_label, color = is_significant),
+    vjust = -1.1, size = 3, show.legend = FALSE
+  ) +
+
+  # Reference line at HR = 1
+  geom_vline(xintercept = 1, linetype = "dashed", color = "red") +
+
+  # Axis scaling and formatting
+  scale_x_log10(
+    breaks = c(0.1, 0.5, 1, 2, 4, 8, 16, 32, 64),
+    labels = c("0.1", "0.5", "1", "2", "4", "8", "16", "32", "64")
+  ) +
+  coord_cartesian(xlim = c(0.1, cap_limit)) +
+  labs(x = "Hazard Ratio (95% CI)", y = "Variant") +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(hjust = 1, size = 9)
+  )
+
+# Add arrows for truncated CI
+forest_plot <- forest_plot +
+  geom_segment(
+    data = results_df %>% filter(clipped),
+    aes(x = cap_limit * 0.95, xend = cap_limit * 0.99, y = variant, yend = variant),
+    arrow = arrow(length = unit(0.15, "cm"), type = "closed"),
+    color = "black", linewidth = 0.5
+  )
+
+# Display and save
+print(forest_plot)
+# ggsave("../out/cox_regression_analysis/carrier_only/combined_forest_plot_3_sema4.pdf",
+#        forest_plot, width = 4, height = 3, useDingbats = FALSE, dpi = 1200)
+
+```
+```
+

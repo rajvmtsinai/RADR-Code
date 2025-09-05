@@ -1,0 +1,161 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(survival)
+library(stats)
+library(broom)
+library(tidyr)
+library(stringr)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(ggpubr)
+library(survminer)
+library(openxlsx)
+```
+```{r}
+setwd("/Users/rajva/OneDrive - The Mount Sinai Hospital/Huang_lab/manuscripts/ADRiskPrediction/data/sema4_data/")
+data = read.csv("cox_regression_data_sema4.csv")
+
+# Filter for variants with more than 20 carriers
+filtered_data <- data %>%
+  group_by(Variant) %>%
+  filter(sum(Genotype %in% c("0/1", "1/1"), na.rm = TRUE) >= 10)
+
+#Combine genotype data into 0 or 1 depending on if patient is carrier or not
+filtered_data$carrier = ifelse(filtered_data$Genotype == "0/0", 0, 1)
+```
+```{r}
+#Output path for carrier status only
+output_path <- "../out/multivariate_regression_analysis/carrier_status_only/"
+
+#Perform multiple logistic regression analysis
+results_4 <- list()
+variant_names <- unique(filtered_data$Variant)
+
+for (variant in unique(filtered_data$Variant)) {
+  variant_data <- filtered_data %>% filter(Variant == variant)
+  
+# Define the logistic model formula
+  logistic_model <- as.formula(dementia_present ~ carrier + GENDER + AGE_OF_ENTRY + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10)
+  
+  # Fit the logistic model
+  fit <- glm(logistic_model, data = variant_data, family = binomial)
+  
+  # Store the fitted model in the list
+  results_4[[variant]] <- fit
+}
+```
+```{r}
+# Function to extract odds ratio and confidence interval for carrier status
+extract_or_ci <- function(variant) {
+  fit <- results_4[[variant]]
+  tidy_result <- tidy(fit, conf.int = TRUE)
+  carrier_row <- tidy_result %>% filter(term == "carrier")
+  
+  # Calculate odds ratio and confidence intervals by exponentiating the coefficients
+  odds_ratio <- exp(carrier_row$estimate)
+  lower_ci <- exp(carrier_row$conf.low)
+  upper_ci <- exp(carrier_row$conf.high)
+  p_value <- carrier_row$p.value
+  
+  return(c(variant = variant, odds_ratio = odds_ratio, lower_ci = lower_ci, upper_ci = upper_ci, p_value = p_value))
+}
+
+# Apply the function to all variants
+results <- lapply(names(results_4), extract_or_ci)
+results_df <- do.call(rbind, results) %>% as.data.frame()
+
+
+# Convert character columns to numeric
+results_df[, 2:5] <- lapply(results_df[, 2:5], as.numeric)
+
+# Identify infinite confidence intervals
+results_df$lower_ci[is.infinite(results_df$lower_ci)] <- NA
+results_df$upper_ci[is.infinite(results_df$upper_ci)] <- NA
+results_df$odds_ratio_label <- ifelse(is.na(results_df$lower_ci) | is.na(results_df$upper_ci), "inf", round(results_df$odds_ratio, 2))
+
+# Remove variants with odds ratio of 0 or inf 
+results_df <- results_df %>% filter(odds_ratio_label != 0,odds_ratio_label != "inf")
+
+
+# Correct for multiple testing using p.adjust (e.g., FDR method)
+results_df$p_value_adjusted <- p.adjust(results_df$p_value, method = "fdr")
+
+results_df <- results_df %>%
+  arrange(odds_ratio) %>%
+  mutate(variant = factor(variant, levels = rev(variant)))  # lowest OR at top
+
+
+```
+```{r}
+# Prepare data with clipping and label columns
+results_df <- results_df %>%
+  mutate(
+    lower_ci_plot = pmax(lower_ci, 0.1),
+    upper_ci_plot = pmin(upper_ci, cap_limit),
+    clipped = upper_ci > cap_limit,
+    is_significant = p_value_adjusted < 0.05,
+    or_label = ifelse(clipped, paste0(odds_ratio_label, "*"), odds_ratio_label),
+    label_color = ifelse(is_significant, "red", "black")
+  )
+
+# Create forest plot with correct layering
+forest_plot <- ggplot(results_df, aes(y = variant, x = odds_ratio)) +
+  # CI lines first
+  geom_errorbarh(aes(xmin = lower_ci_plot, xmax = upper_ci_plot), height = 0.2) +
+
+  # Draw points second (on top of CI)
+  geom_point(aes(color = is_significant), size = 3) +
+  scale_color_manual(values = c("black", "red"), guide = "none") +
+
+  # Label for non-clipped: label at end of CI
+  geom_text(
+    data = results_df %>% filter(!clipped),
+    aes(x = upper_ci_plot, label = or_label, color = is_significant),
+    hjust = -0.1, size = 3, show.legend = FALSE
+  ) +
+
+  # Label for clipped: label above dot
+  geom_text(
+    data = results_df %>% filter(clipped),
+    aes(x = odds_ratio, label = or_label, color = is_significant),
+    vjust = -1, size = 3, show.legend = FALSE
+  ) +
+
+  # Vertical reference line
+  geom_vline(xintercept = 1, linetype = "dashed", color = "red") +
+
+  # Axes
+  scale_x_log10(
+    breaks = c(0.1, 0.5, 1, 2, 4, 8, 16, 32, 64),
+    labels = c("0.1", "0.5", "1", "2", "4", "8", "16", "32", "64")
+  ) +
+  coord_cartesian(xlim = c(0.1, cap_limit)) +
+  labs(x = "Odds Ratio (95% CI)", y = "Variant") +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(hjust = 1, size = 8)
+  )
+
+# Add rightward arrows for clipped CIs
+forest_plot <- forest_plot +
+  geom_segment(
+    data = results_df %>% filter(clipped),
+    aes(x = cap_limit * 0.95, xend = cap_limit * 0.99, y = variant, yend = variant),
+    arrow = arrow(length = unit(0.15, "cm"), type = "closed"),
+    color = "black", linewidth = 0.5
+  )
+
+# Save and display
+# ggsave(
+#   paste0(output_path, "combined_forest_plot_sema4.pdf"),
+#   forest_plot, width = 4, height = 3, dpi = 1200, useDingbats = FALSE
+# )
+print(forest_plot)
+
+
+```

@@ -1,0 +1,121 @@
+```{r}
+library(tidyr)
+library(stringr)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(vcfR)
+library(stats)
+library(survival)
+library(gridExtra)
+library(broom)
+
+```
+```{r}
+#Load vcf file with pathogenic, likely pathogenic and risk factor variants and sample genotypes 
+setwd('/sc/arion/projects/rg_huangk06/')
+variants = read.vcfR("ADRiskPrediction/data/july_2025/merged_p_lp_risk_sort.vcf.gz")
+variants_df = vcfR2tidy(variants)
+
+#Load in case_control file
+phenotypes = read.csv("ADRiskPrediction/data/case_control_v2.csv")
+phenotypes = subset(phenotypes, select = c("index", "phenotypes"))
+colnames(phenotypes) = c("sample_id", "phenotype")
+
+#Load in RADR
+radr = read.csv("ADRiskPrediction/data/april_test/RADR_5_2_2023_plotting.csv")
+
+#Load in Covariates
+covariates = read.csv("ADRiskPrediction/data/analysis_file_latest_dates_v3.csv")
+covariates <- covariates %>% rename(Sample = colnames(covariates)[1])
+
+```
+
+```{r}
+#Load VCF elements 
+var_fixed <- unique(variants_df$fix)
+var_gt_tidy <- variants_df$gt
+var_gt <- extract.gt(variants)  # rows = variants, columns = samples
+
+#Merge fixed VCF info with RADR annotation 
+merged_df_radr <- merge(var_fixed, radr, 
+                        by.x = c("CHROM", "POS", "REF", "ALT"), 
+                        by.y = c("Chromosome", "Position", "Ref", "Alt"))
+merged_df_radr <- merged_df_radr[!duplicated(merged_df_radr[, c("CHROM", "POS", "REF", "ALT")]),] 
+merged_df_radr$variant <- paste0(merged_df_radr$Gene, ":", merged_df_radr$HgvsP)
+
+#Attach VCF row index to enable correct ordering 
+vcf_coords <- var_fixed %>%
+  mutate(rownum = row_number()) %>%
+  select(rownum, CHROM, POS, REF, ALT)
+
+merged_df_radr_ordered <- merge(merged_df_radr, vcf_coords,
+                                by = c("CHROM", "POS", "REF", "ALT")) %>%
+  arrange(rownum) %>%
+  mutate(variant = ifelse(ExonicFunc.knownGene == "Unknown intronic function",
+                          paste(Gene, GH38.gDNA.Coordinates, sep = ":"),
+                          variant))
+
+#Sanity check: make sure ordering matches genotype matrix 
+stopifnot(nrow(merged_df_radr_ordered) == nrow(var_gt))
+
+#Assign variant labels to genotype matrix 
+rownames(var_gt) <- merged_df_radr_ordered$variant
+
+#Join tidy GT table with variant annotations 
+joined_table <- merge(var_gt_tidy, merged_df_radr_ordered, by = "POS")
+
+#Create final variant-genotype matrix 
+var_gt_radr <- cbind(
+  merged_df_radr_ordered %>% select(CHROM, POS, REF, ALT, AC, Gene, variant),
+  var_gt
+)
+
+#Identify relevant samples 
+sample_cols <- colnames(var_gt_radr)[8:ncol(var_gt_radr)]
+sample_ids <- unique(phenotypes$sample_id)
+matching_ids <- intersect(sample_cols, sample_ids)
+
+#compute phenotype counts
+phenotype_counts <- phenotypes %>%
+  filter(sample_id %in% matching_ids) %>%
+  count(phenotype, name = "n_samples")
+
+
+#Filter tidy GT table to just relevant samples
+filtered_data <- joined_table %>% filter(Indiv %in% sample_ids)
+
+#Subset genotype matrix to matched samples 
+gt <- var_gt[, matching_ids]
+```
+
+```{r}
+#Convert the genotype matrix to long format and merge with covariates
+gt_long <- as.data.frame(t(gt))
+gt_long$Sample <- rownames(gt_long)
+gt_long <- gt_long %>% gather(Variant, Genotype, -Sample)
+```
+
+```{r}
+# Merge with covariates
+data <- merge(covariates, gt_long, by = "Sample")
+
+# Convert categorical variables to factors
+data$GENDER <- as.factor(data$GENDER)
+data$Genotype <- as.factor(data$Genotype)
+
+
+# List of phenotype columns
+phenotype_cols <- c("EOAD", "Frontotemporal.Dementia", "HIV.dementia", "Huntington.s.Disease.Dementia", 
+                    "LOAD", "Lewy.Body.Dementia", "Parkinson.Dementia", "Senile.Dementia", 
+                    "Vascular.Dementia", "Unspecified.AD", "Unspecified.Dementia", 
+                    "AD.Drugs...Unspecified.Dementia")
+data$dementia_present <- apply(data[, phenotype_cols], 1, function(row) {
+  ifelse(any(row == 1), 1, 0)
+
+})
+```
+```{r}
+#Save filtered_data for summary statistics
+#write.csv(data, "../data/analysis/cox_regression_data_v4.csv")
+```
