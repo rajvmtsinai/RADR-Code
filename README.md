@@ -17,6 +17,9 @@ This README describes how to use the project files in the respository. It explai
   For each variant, fits a Cox proportional hazards model on time-to-onset (e.g., `Surv(AGE_OF_ENTRY, dementia_present) ~ carrier + GENDER + PCs`), extracts hazard ratios (HR) with 95% CIs, and draws a log-scale forest plot.  
   A knitted HTML copy may be present as: **`Cox Regression.nb.html`**
 
+- **`PC_Plots.Rmd`**  
+  Creates ancestry principal component (PC) scatter plots for the full cohort and for carriers of each P/LP/RF variant. It merges PC coordinates with genetic ancestry labels and sample IDs, identifies variant carriers from VCF genotypes, and generates per-variant PC1 vs PC2 visualizations with consistent ancestry color mapping.
+
 ---
 
 ## Software and R Packages
@@ -24,6 +27,8 @@ This README describes how to use the project files in the respository. It explai
 R (recent version) with the following packages: survival, stats, gridExtra, broom, tidyr, stringr, dplyr, reshape2, ggplot2, ggpubr, survminer, openxlsx
 
 If you are building the dataset directly from VCF files, you may also need: `vcfR`.
+
+For principal-component ancestry plots, you may also need: `viridisLite`, `readxl`, `MatchIt`, and `RColorBrewer`.
 
 ---
 
@@ -75,6 +80,18 @@ Extracts HR, 95% CI, p-value; creates a log-scale forest plot with a reference a
 
 Optional: uncomment ggsave(...) lines to write high-DPI PDF(s) to a chosen folder.
 
+### D) PC_Plots.Rmd (Ancestry Visualization)
+- Loads principal component coordinates and genetic ancestry calls per sample.
+- Merges participant IDs with cohort metadata to align sample identifiers.
+- Reads variant calls from VCF and links them to RADR annotations.
+- Identifies carrier samples (`0/1` or `1/1`) for each variant.
+- Creates:
+  - a cohort-level PC1 vs PC2 ancestry plot, and
+  - per-variant PC1 vs PC2 carrier ancestry plots.
+- Uses fixed ancestry categories (`AFR`, `EAS`, `EUR`, `HIS`, `OTHER`, `SAS`) and a consistent custom palette.
+
+Optional: uncomment `ggsave(...)` lines to export PNG files for each per-variant plot and the cohort plot.
+
 
 ## How to Run (Plain-Folder Setup)
 
@@ -97,11 +114,24 @@ Optional: uncomment ggsave(...) lines to write high-DPI PDF(s) to a chosen folde
 * Ensure the merged dataset and (optional) APOE status are available (or load them from saved CSVs).
 * Run to produce results and the forest plot.
 
+### 4) Run ancestry PC plots
+
+* Open `PC_Plots.Rmd`.
+* Update file paths for:
+  - the PC file,
+  - the ancestry labels file,
+  - cohort/sample ID mapping,
+  - VCF input,
+  - RADR annotation,
+  - phenotype table.
+* Run all chunks to generate per-variant carrier ancestry plots and the full-cohort ancestry PC plot.
+
 ---
 
 ## Outputs
 
 * **Figures:** Forest plots print during the run. To save high-resolution PDFs, uncomment the `ggsave(...)` lines in each notebook and specify a relative path within this folder (e.g., `out/plots/...`).
+* **Ancestry plots:** `PC_Plots.Rmd` prints PC scatter plots to the plotting device. To save files, uncomment the `ggsave(...)` lines and set an output directory.
 
 ---
 
