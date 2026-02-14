@@ -20,11 +20,14 @@ This README describes how to use the project files in the respository. It explai
 - **`PC_Plots.Rmd`**  
   Creates ancestry principal component (PC) scatter plots for the full cohort and for carriers of each P/LP/RF variant. It merges PC coordinates with genetic ancestry labels and sample IDs, identifies variant carriers from VCF genotypes, and generates per-variant PC1 vs PC2 visualizations with consistent ancestry color mapping.
 
+- **`APOE_cox_logistic_regression.Rmd`**
+  Runs per-variant APOE-adjusted Cox and logistic regression models from a regression-ready CSV plus an APOE sample table. It standardizes APOE labels, derives E2/E4 dosage, filters variants by minimum carrier count, and writes APOE-adjusted effect-size result tables (including optional interaction tests).
+
 ---
 
 ## Software and R Packages
 
-R (recent version) with the following packages: survival, stats, gridExtra, broom, tidyr, stringr, dplyr, reshape2, ggplot2, ggpubr, survminer, openxlsx
+R (recent version) with the following packages: survival, stats, gridExtra, broom, tidyr, stringr, dplyr, reshape2, ggplot2, ggpubr, survminer, openxlsx, readr, purrr
 
 If you are building the dataset directly from VCF files, you may also need: `vcfR`.
 
@@ -92,6 +95,20 @@ Optional: uncomment ggsave(...) lines to write high-DPI PDF(s) to a chosen folde
 
 Optional: uncomment `ggsave(...)` lines to export PNG files for each per-variant plot and the cohort plot.
 
+### E) APOE_cox_logistic_regression.Rmd (APOE-Adjusted Variant Models)
+- Reads a per-variant regression dataset (`cox_regression_data.csv`) and APOE table (`apoe_status.csv`) using configurable column names.
+- Joins APOE onto the analysis dataset and harmonizes APOE labels to `E2/E3/E4` combinations (e.g., `E3-E3`, `E2-E4`, `E4-E4`).
+- Creates APOE dosage covariates (`e2_dosage`, `e4_dosage`) and binary `carrier` from genotype (`0/0` vs carrier).
+- Filters variants by minimum carrier count (`MIN_CARRIERS`) before modeling.
+- Fits per-variant APOE-adjusted Cox models and saves:
+  - `out/apoe_adjusted_models/cox_variant_effects_apoe_adjusted.csv`
+  - `out/apoe_adjusted_models/sanity_apoe_status_counts.csv`
+  - `out/apoe_adjusted_models/sanity_carrier_by_apoe.csv`
+- Optionally tests carrier-by-APOE interaction (default: `carrier * e4_dosage`; optional factor interaction).
+- Fits APOE-adjusted logistic models and saves:
+  - `out/apoe_adjusted_models/logit_variant_effects_apoe_adjusted.csv`
+  - `out/apoe_adjusted_models/significant_variants_effect_sizes_apoe_adjusted.csv`
+
 
 ## How to Run (Plain-Folder Setup)
 
@@ -125,6 +142,18 @@ Optional: uncomment `ggsave(...)` lines to export PNG files for each per-variant
   - RADR annotation,
   - phenotype table.
 * Run all chunks to generate per-variant carrier ancestry plots and the full-cohort ancestry PC plot.
+
+### 5) Run APOE-adjusted Cox + logistic models
+
+* Open `APOE_cox_logistic_regression.Rmd`.
+* Update the configuration block at the top for:
+  - input file paths (`COX_DATA_PATH`, `APOE_DATA_PATH`),
+  - sample ID columns (`COX_SAMPLE_COL`, `APOE_SAMPLE_COL`),
+  - covariate names (`SEX_COL`, `PC_COLS`),
+  - outcome/time columns (`EVENT_COL`, `TIME_COL`), and
+  - minimum carrier threshold (`MIN_CARRIERS`).
+* Confirm `TIME_COL` is age-at-event for cases and age-at-censoring for controls.
+* Run all chunks to generate APOE-adjusted model outputs under `out/apoe_adjusted_models/`.
 
 ---
 
