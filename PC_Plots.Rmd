@@ -1,0 +1,246 @@
+```{r}
+library(tidyr)
+library(stringr)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(vcfR)
+library(viridisLite)
+library(readxl)
+library(MatchIt)
+library(RColorBrewer)
+```
+```{r}
+#Load in PC file and genetic ancestry file for each sample
+PC = read.table("pc file path", header = T)
+ancestry = read.csv("ancestry file path", header = T, sep = " ")
+
+#Cohort file
+masked_mrn_rgnid_biome = read.csv("../data/RGNIDupdate.txt", sep=" ", header = F)
+pc_ancestry = merge(pc_ancestry, masked_mrn_rgnid_biome, by.x = "ID1", by.y = "V1")
+
+
+# #Read in VCF Files
+variants = read.vcfR("vcf path")
+variants_all_df = vcfR2tidy(variants)
+
+#Read in CSV files
+#RADR
+radr = read.csv("load in radr file")
+
+preferred_name_from_radr <- function(row) {
+  # Expect row to be a named vector/list/data.frame row with fields:
+  # Gene, HGVSp_brief, HGVSg (adjust names if your columns differ)
+
+  gene <- row[["Gene"]]
+  hgvsp_brief <- row[["HGVSp_brief"]]
+  hgvsg <- row[["HGVSg"]]
+
+  # Normalize missing values
+  is_missing <- function(x) {
+    is.null(x) || length(x) == 0 || is.na(x) || x == "." || x == ""
+  }
+
+  # Prioritize HGVSp_brief (protein) then HGVSg (genomic)
+  if (!is_missing(gene) && !is_missing(hgvsp_brief)) {
+    protein <- if (startsWith(hgvsp_brief, "p.")) hgvsp_brief else paste0("p.", hgvsp_brief)
+    return(paste0(gene, ":", protein))
+  }
+
+  if (!is_missing(gene) && !is_missing(hgvsg)) {
+    return(paste0(gene, ":", hgvsg))
+  }
+
+  ""
+}
+radr$variant = apply(radr, 1, preferred_name_from_radr)
+
+#Case Control File
+phenotypes = read.csv("phenotype/case control file path")
+
+```
+```{r}
+#Load VCF elements
+var_fixed <- unique(variants_all_df$fix)
+var_gt_tidy <- variants_all_df$gt
+var_gt <- extract.gt(variants)  # rows = variants, columns = samples
+
+# Merge fixed VCF info with RADR annotation
+merged_df_radr <- merge(var_fixed, radr, 
+                        by.x = c("CHROM", "POS", "REF", "ALT"), 
+                        by.y = c("Chromosome", "Position", "Ref", "Alt"))
+merged_df_radr <- merged_df_radr[!duplicated(merged_df_radr[, c("CHROM", "POS", "REF", "ALT")]),] 
+
+# Attach VCF row index to enable correct ordering
+vcf_coords <- var_fixed %>%
+  mutate(rownum = row_number()) %>%
+  select(rownum, CHROM, POS, REF, ALT)
+
+merged_df_radr_ordered <- merge(merged_df_radr, vcf_coords,
+                                by = c("CHROM","POS","REF","ALT")) %>% arrange(rownum)
+
+stopifnot(nrow(merged_df_radr_ordered) == nrow(var_gt))
+rownames(var_gt) <- merged_df_radr_ordered$variant
+
+
+#Join tidy GT table with variant annotations 
+if (all(c("CHROM","POS","REF","ALT") %in% colnames(var_gt_tidy))) {
+  joined_table <- merge(var_gt_tidy, merged_df_radr_ordered,
+                        by = c("CHROM","POS","REF","ALT"))
+} else if (all(c("CHROM","POS") %in% colnames(var_gt_tidy))) {
+  joined_table <- merge(var_gt_tidy, merged_df_radr_ordered,
+                        by = c("CHROM","POS"))
+} else {
+  stop("var_gt_tidy missing CHROM/POS fields; cannot safely merge.")
+}
+
+#Create final variant-genotype matrix
+var_gt_radr <- cbind(
+  merged_df_radr_ordered %>% select(CHROM, POS, REF, ALT, AC, Gene, variant),
+  var_gt
+)
+
+# --- Identify relevant samples ---
+sample_cols <- colnames(var_gt_radr)[8:ncol(var_gt_radr)]
+sample_ids <- unique(phenotypes$sample_id)
+matching_ids <- intersect(sample_cols, sample_ids)
+
+#compute phenotype counts
+phenotype_counts <- phenotypes %>%
+  filter(sample_id %in% matching_ids) %>%
+  count(phenotype, name = "n_samples")
+
+
+# --- Filter tidy GT table to just relevant samples ---
+filtered_data <- joined_table %>% filter(Indiv %in% sample_ids)
+
+# --- Subset genotype matrix to matched samples ---
+genotype_data <- as.data.frame(var_gt[, matching_ids])
+```
+
+```{r}
+
+# Initialize an empty list to store the carriers for each variant
+p_lp_carriers_list <- list()
+# Create a new column "Variant" with "Non-Carriers" for all rows
+pc_ancestry$Variant <- "Non-Carriers"
+
+
+for (var in rownames(genotype_data)) {
+  # Extract the column names where the genotype is "1/1" or "0/1"
+  cols_with_variant <- colnames(genotype_data)[genotype_data[var, ] %in% c("1/1", "0/1")]
+  p_lp_carriers_list[[var]] = cols_with_variant
+  pc_ancestry$Variant[pc_ancestry$V3 %in% p_lp_carriers_list[[var]]] = var
+
+}
+
+variants = unique(pc_ancestry$Variant)
+
+# Remove elements containing "x"
+variants <- variants[!grepl("Non-Carriers", variants)]
+
+```
+```{r}
+# Fixed ancestry order
+ancestry_levels <- c("AFR","EAS","EUR","HIS","OTHER","SAS")
+
+# Custom palette mapping
+ancestry_colors <- c(
+  AFR   = "#E41A1CFF",  # red
+  EAS   = "#FF7F00FF",  # orange
+  EUR   = "#4DAF4AFF",  # green
+  HIS   = "#377EB8FF",  # blue
+  OTHER = "#FFFF33FF",   # yellow
+  SAS   = "#984EA3FF"  # purple
+
+)
+
+generate_variant_plot <- function(variant_text) {
+  pc_ancestry$genetically_determined <- factor(
+    pc_ancestry$genetically_determined, levels = ancestry_levels
+  )
+
+  filtered_data <- pc_ancestry[pc_ancestry$Variant == variant_text, ]
+
+  plot = ggplot(filtered_data, aes(x = PC1, y = PC2, color = genetically_determined)) +
+    geom_point(alpha = 0.6) +
+    scale_color_manual(values = ancestry_colors, limits = ancestry_levels, drop = FALSE,
+                       name = "Ancestry") +
+    theme_bw() +
+    labs(x = "PC1", y = "PC2") +
+    ggtitle(paste(variant_text, "Carrier Ancestry")) +
+    theme(
+      axis.title = element_text(size = 12),
+      axis.text.x = element_text(colour = "black", size = 12, angle = 90, vjust = 0.5),
+      axis.text.y = element_text(colour = "black", size = 12),
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    scale_x_continuous(limits = c(-0.0065, 0.015), breaks = seq(-0.0065, 0.015, 0.005)) +
+    scale_y_continuous(limits = c(-0.0065, 0.025), breaks = seq(-0.0065, 0.025, 0.005))
+  
+  return(plot)
+}
+
+```
+
+```{r}
+print(unique(pc_ancestry$genetically_determined))
+```
+
+```{r}
+#Make a PC Plot of Ancestry for all P/LP/RF Variants
+for (var in variants){
+  p = generate_variant_plot(var)
+  print(p)
+  #ggsave(paste0("../data/PC_Carrier_Plots_BioMe/", var, ".png"), p, w=6, h=5, dpi = 1200)
+}
+```
+
+```{r}
+plot = ggplot(pc_ancestry, aes(x = PC1, y = PC2, color = genetically_determined)) +
+    geom_point(alpha = 0.6) +
+    scale_color_manual(values = ancestry_colors, limits = ancestry_levels, drop = FALSE,
+                       name = "Ancestry") +
+    theme_bw() +
+    labs(x = "PC1", y = "PC2") +
+    ggtitle("PC Ancestry") +
+    theme(
+      axis.title = element_text(size = 12),
+      axis.text.x = element_text(colour = "black", size = 12, angle = 90, vjust = 0.5),
+      axis.text.y = element_text(colour = "black", size = 12),
+      plot.title = element_text(hjust = 0.5)
+    ) +
+    scale_x_continuous(limits = c(-0.0065, 0.015), breaks = seq(-0.0065, 0.015, 0.005)) +
+    scale_y_continuous(limits = c(-0.0065, 0.025), breaks = seq(-0.0065, 0.025, 0.005))
+  
+# Display the plot
+print(plot)
+
+#ggsave("../data/PC_Carrier_Plots_BioMe/BioMe_PC_Plot.png", plot, w = 6.5, h = 5, dpi = 600)
+
+```
+```{r}
+# Calculate the count of each ancestry for each variant
+ancestry_counts <- pc_ancestry %>%
+  group_by(Variant, genetically_determined) %>%
+  summarise(count = n()) %>%
+  ungroup()
+
+# Calculate the total number of samples for each variant
+total_counts <- ancestry_counts %>%
+  group_by(Variant) %>%
+  summarise(total = sum(count)) %>%
+  ungroup()
+
+# Merge the counts with the total counts
+ancestry_proportions <- ancestry_counts %>%
+  left_join(total_counts, by = "Variant") %>%
+  mutate(proportion = count / total)
+
+# Display the ancestry proportions for each variant
+print(ancestry_proportions)
+```
+
+
+
+
