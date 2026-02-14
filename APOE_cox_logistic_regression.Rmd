@@ -1,0 +1,440 @@
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+  library(tidyr)
+  library(readr)
+  library(purrr)
+  library(broom)
+  library(survival)
+})
+```
+```{r}
+# 0) CONFIGURATION (edit these paths/column names only)
+
+# Input files
+COX_DATA_PATH  <- "cox_regression_data.csv"   # per-variant rows
+APOE_DATA_PATH <- "apoe_status.csv"                 # sample-level APOE
+
+# Output folder
+OUT_DIR <- "out/apoe_adjusted_models"
+
+# Join keys
+COX_SAMPLE_COL  <- "Sample"
+APOE_SAMPLE_COL <- "sample_id"
+
+# Required columns in COX dataset
+VARIANT_COL <- "Variant"
+GENOTYPE_COL <- "Genotype"
+
+# Cox outcome columns (IMPORTANT: time must be age-at-event for cases AND age-at-censoring for controls)
+TIME_COL  <- "AGE_OF_ENTRY"
+EVENT_COL <- "dementia_present"
+
+# Covariates
+SEX_COL <- "GENDER"
+PC_COLS <- c("PC1","PC2","PC3","PC4","PC5","PC6","PC8","PC9","PC10")  # adjust as needed
+
+# Carrier definition (0/0 = non-carrier; anything else among 0/1,1/1 = carrier)
+NONCARRIER_GT <- "0/0"
+
+# Minimum number of carriers per variant (carrier defined as Genotype != "0/0")
+MIN_CARRIERS <- 10  # set to 20 if you truly want >20; your current code uses 10
+
+# APOE handling:
+# Option A (preferred): input has APOE_Status with these labels
+APOE_STATUS_LEVELS <- c("E3-E3","E2-E3","E2-E4","E3-E4","E4-E4")
+
+# Option B: input has APOE_Genotype (e.g., "E2/E4", "E3/E3", "e3-e4"), we will standardize it
+APOE_STATUS_COL   <- "APOE_Status"
+APOE_GENOTYPE_COL <- "APOE_Genotype"  # optional fallback
+
+# Model switches
+RUN_INTERACTION_WITH_E4_DOSAGE <- TRUE   # tests carrier * e4_dosage interaction (recommended over factor interaction)
+RUN_FACTOR_INTERACTION         <- FALSE  # carrier * APOE_Status (often underpowered + harder to interpret)
+```
+```{R}
+# 1) UTILITIES 
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+stop_if_missing_cols <- function(df, cols, df_name = "dataframe") {
+  missing <- setdiff(cols, colnames(df))
+  if (length(missing) > 0) {
+    stop(sprintf(
+      "[%s] missing required columns: %s",
+      df_name, paste(missing, collapse = ", ")
+    ), call. = FALSE)
+  }
+}
+
+# Standardize APOE genotype strings to "E2-E4" style and enforce allowed set
+standardize_apoe_status <- function(x) {
+  x <- as.character(x)
+  x <- str_trim(x)
+  x <- str_to_upper(x)
+
+  # Convert common separators to a single delimiter
+  x <- str_replace_all(x, "[/_|]", "-")
+  x <- str_replace_all(x, "\\s+", "")
+  x <- str_replace_all(x, "E?([234])\\-E?([234])", "E\\1-E\\2")
+
+  # If already like "E2-E3" keep; otherwise NA
+  ok <- x %in% APOE_STATUS_LEVELS
+  x[!ok] <- NA_character_
+
+  # Canonicalize order: smaller allele first, e.g., E4-E2 -> E2-E4
+  # (This only applies if users accidentally provide reversed order.)
+  split <- str_split(x, "-", simplify = TRUE)
+  if (ncol(split) == 2) {
+    a1 <- split[,1]
+    a2 <- split[,2]
+    # Extract numeric allele
+    n1 <- suppressWarnings(as.integer(str_remove(a1, "E")))
+    n2 <- suppressWarnings(as.integer(str_remove(a2, "E")))
+    reorder_idx <- which(!is.na(n1) & !is.na(n2) & n1 > n2)
+    if (length(reorder_idx) > 0) {
+      tmp <- a1[reorder_idx]
+      a1[reorder_idx] <- a2[reorder_idx]
+      a2[reorder_idx] <- tmp
+      x[reorder_idx] <- paste0(a1[reorder_idx], "-", a2[reorder_idx])
+    }
+  }
+
+  x
+}
+
+# Create e2/e4 dosage from APOE_Status
+apoe_dosage_from_status <- function(status) {
+  status <- as.character(status)
+  # Count occurrences of E2 and E4
+  e2 <- ifelse(is.na(status), NA_integer_, str_count(status, "E2"))
+  e4 <- ifelse(is.na(status), NA_integer_, str_count(status, "E4"))
+  tibble(e2_dosage = as.integer(e2), e4_dosage = as.integer(e4))
+}
+
+# Safe Cox fit wrapper
+safe_coxph <- function(formula, data) {
+  tryCatch(
+    coxph(formula, data = data, ties = "efron"),
+    error = function(e) e
+  )
+}
+
+# Extract HR/CI/p for a specific term from a coxph object
+extract_cox_term <- function(fit, term) {
+  s <- summary(fit)
+  if (!(term %in% rownames(s$coefficients))) {
+    return(tibble(
+      term = term,
+      hr = NA_real_, lower_ci = NA_real_, upper_ci = NA_real_, p_value = NA_real_
+    ))
+  }
+  tibble(
+    term = term,
+    hr = unname(s$conf.int[term, "exp(coef)"]),
+    lower_ci = unname(s$conf.int[term, "lower .95"]),
+    upper_ci = unname(s$conf.int[term, "upper .95"]),
+    p_value = unname(s$coefficients[term, "Pr(>|z|)"])
+  )
+}
+```
+```{r}
+# 2) LOAD + VALIDATE INPUTS
+
+cox_data <- read_csv(COX_DATA_PATH, show_col_types = FALSE)
+apoe_df  <- read_csv(APOE_DATA_PATH, show_col_types = FALSE)
+
+stop_if_missing_cols(cox_data, c(COX_SAMPLE_COL, VARIANT_COL, GENOTYPE_COL, TIME_COL, EVENT_COL, SEX_COL, PC_COLS), "cox_data")
+stop_if_missing_cols(apoe_df, c(APOE_SAMPLE_COL), "apoe_df")
+
+# Attach APOE to cox_data
+data <- cox_data %>%
+  left_join(apoe_df, by = setNames(APOE_SAMPLE_COL, COX_SAMPLE_COL))
+
+# Derive/standardize APOE_Status (either from APOE_Status or APOE_Genotype)
+if (APOE_STATUS_COL %in% colnames(data)) {
+  data <- data %>%
+    mutate(APOE_Status = standardize_apoe_status(.data[[APOE_STATUS_COL]]))
+} else if (APOE_GENOTYPE_COL %in% colnames(data)) {
+  data <- data %>%
+    mutate(APOE_Status = standardize_apoe_status(.data[[APOE_GENOTYPE_COL]]))
+} else {
+  stop(sprintf(
+    "APOE data must provide either '%s' or '%s' after join.",
+    APOE_STATUS_COL, APOE_GENOTYPE_COL
+  ), call. = FALSE)
+}
+
+# Ensure APOE_Status factor with E3-E3 as reference
+data <- data %>%
+  mutate(
+    APOE_Status = factor(APOE_Status, levels = APOE_STATUS_LEVELS),
+    carrier = ifelse(.data[[GENOTYPE_COL]] == NONCARRIER_GT, 0L, 1L)
+  )
+
+# Add e2/e4 dosage
+data <- bind_cols(data, apoe_dosage_from_status(data$APOE_Status))
+
+# Basic sanity checks (write to file for collaborators)
+sanity <- list(
+  apoe_status_counts = data %>% count(APOE_Status, sort = TRUE),
+  carrier_by_apoe = data %>% count(carrier, APOE_Status, sort = TRUE)
+)
+
+write_csv(sanity$apoe_status_counts, file.path(OUT_DIR, "sanity_apoe_status_counts.csv"))
+write_csv(sanity$carrier_by_apoe,       file.path(OUT_DIR, "sanity_carrier_by_apoe.csv"))
+```
+```{r}
+# 3) FILTER VARIANTS BY CARRIER COUNT
+filtered_data <- data %>%
+  group_by(.data[[VARIANT_COL]]) %>%
+  mutate(n_carriers = sum(carrier == 1L, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(n_carriers >= MIN_CARRIERS)
+
+if (nrow(filtered_data) == 0) {
+  stop("No variants remain after carrier-count filtering. Check MIN_CARRIERS and carrier definition.", call. = FALSE)
+}
+
+variants_to_test <- sort(unique(filtered_data[[VARIANT_COL]]))
+```
+```{r}
+# 4) PER-VARIANT COX MODELS (APOE-adjusted carrier effect)
+
+# Cox regression formulas 
+base_covars <- c("carrier", "APOE_Status", SEX_COL, PC_COLS)
+cox_formula_main <- as.formula(
+  paste0("Surv(", TIME_COL, ", ", EVENT_COL, ") ~ ", paste(base_covars, collapse = " + "))
+)
+
+# Optional interaction formulas
+cox_formula_e4_int <- as.formula(
+  paste0("Surv(", TIME_COL, ", ", EVENT_COL, ") ~ carrier * e4_dosage + e2_dosage + ",
+         paste(c(SEX_COL, PC_COLS), collapse = " + "))
+)
+
+cox_formula_factor_int <- as.formula(
+  paste0("Surv(", TIME_COL, ", ", EVENT_COL, ") ~ carrier * APOE_Status + ",
+         paste(c(SEX_COL, PC_COLS), collapse = " + "))
+)
+
+fit_one_variant <- function(v) {
+  vd <- filtered_data %>% filter(.data[[VARIANT_COL]] == v)
+
+  # Basic counts for reporting
+  n_total    <- nrow(vd)
+  n_carriers <- sum(vd$carrier == 1L, na.rm = TRUE)
+  n_events   <- sum(vd[[EVENT_COL]] == 1L, na.rm = TRUE)
+  n_events_carriers <- sum(vd[[EVENT_COL]] == 1L & vd$carrier == 1L, na.rm = TRUE)
+
+  # Drop rows with missing essentials for the model
+  needed_main <- c(TIME_COL, EVENT_COL, "carrier", "APOE_Status", SEX_COL, PC_COLS)
+  vd_main <- vd %>%
+    filter(if_all(all_of(needed_main), ~ !is.na(.)))
+
+  # If APOE missing removes too many rows, this will surface as low n_total_used
+  n_used <- nrow(vd_main)
+  if (n_used < 50) {
+    # still attempt, but warn via output fields (no stop)
+  }
+
+  fit <- safe_coxph(cox_formula_main, vd_main)
+  if (inherits(fit, "error")) {
+    return(tibble(
+      Variant = v,
+      n_total = n_total,
+      n_used = n_used,
+      n_carriers = n_carriers,
+      n_events = n_events,
+      n_events_carriers = n_events_carriers,
+      hr = NA_real_, lower_ci = NA_real_, upper_ci = NA_real_, p_value = NA_real_,
+      interaction_p_e4 = NA_real_,
+      interaction_p_factor = NA_real_,
+      fit_error = as.character(fit$message)
+    ))
+  }
+
+  carrier_row <- extract_cox_term(fit, "carrier") %>%
+    transmute(hr, lower_ci, upper_ci, p_value)
+
+  # Optional interaction tests (p-values only; main carrier HR from main model)
+  interaction_p_e4 <- NA_real_
+  if (isTRUE(RUN_INTERACTION_WITH_E4_DOSAGE)) {
+    vd_int <- vd %>%
+      filter(!is.na(.data[[TIME_COL]]), !is.na(.data[[EVENT_COL]]),
+             !is.na(carrier), !is.na(e4_dosage), !is.na(e2_dosage),
+             !is.na(.data[[SEX_COL]])) %>%
+      filter(if_all(all_of(PC_COLS), ~ !is.na(.)))
+
+    fit_int <- safe_coxph(cox_formula_e4_int, vd_int)
+    if (!inherits(fit_int, "error")) {
+      # term name should be "carrier:e4_dosage"
+      s <- summary(fit_int)
+      term <- "carrier:e4_dosage"
+      if (term %in% rownames(s$coefficients)) {
+        interaction_p_e4 <- unname(s$coefficients[term, "Pr(>|z|)"])
+      }
+    }
+  }
+
+  interaction_p_factor <- NA_real_
+  if (isTRUE(RUN_FACTOR_INTERACTION)) {
+    vd_int2 <- vd %>%
+      filter(!is.na(.data[[TIME_COL]]), !is.na(.data[[EVENT_COL]]),
+             !is.na(carrier), !is.na(APOE_Status),
+             !is.na(.data[[SEX_COL]])) %>%
+      filter(if_all(all_of(PC_COLS), ~ !is.na(.)))
+
+    fit_int2 <- safe_coxph(cox_formula_factor_int, vd_int2)
+    if (!inherits(fit_int2, "error")) {
+      # Global LRT for interaction block: compare with non-interaction model on same rows
+      fit_no_int2 <- safe_coxph(cox_formula_main, vd_int2)
+      if (!inherits(fit_no_int2, "error")) {
+        an <- anova(fit_no_int2, fit_int2, test = "LRT")
+        # second row is the full model; p-value is last column
+        interaction_p_factor <- suppressWarnings(as.numeric(an[2, "P(>|Chi|)"]))
+      }
+    }
+  }
+
+  tibble(
+    Variant = v,
+    n_total = n_total,
+    n_used = n_used,
+    n_carriers = n_carriers,
+    n_events = n_events,
+    n_events_carriers = n_events_carriers,
+    hr = carrier_row$hr,
+    lower_ci = carrier_row$lower_ci,
+    upper_ci = carrier_row$upper_ci,
+    p_value = carrier_row$p_value,
+    interaction_p_e4 = interaction_p_e4,
+    interaction_p_factor = interaction_p_factor,
+    fit_error = NA_character_
+  )
+}
+
+cox_results <- map_dfr(variants_to_test, fit_one_variant) %>%
+  mutate(
+    p_fdr = p.adjust(p_value, method = "fdr"),
+    sig_fdr_0.05 = !is.na(p_fdr) & p_fdr < 0.05
+  ) %>%
+  arrange(p_fdr, p_value)
+
+write_csv(cox_results, file.path(OUT_DIR, "cox_variant_effects_apoe_adjusted.csv"))
+```
+```{r}
+# 5)LOGISTIC REGRESSION (APOE-adjusted odds ratios) - if desired
+# Comment out this section if you only want Cox.
+
+safe_glm <- function(formula, data) {
+  tryCatch(
+    glm(formula, data = data, family = binomial()),
+    error = function(e) e
+  )
+}
+
+extract_or_ci <- function(fit, term) {
+  co <- summary(fit)$coefficients
+  if (!(term %in% rownames(co))) {
+    return(tibble(or = NA_real_, lower_ci = NA_real_, upper_ci = NA_real_, p_value = NA_real_))
+  }
+  est <- unname(co[term, "Estimate"])
+  se  <- unname(co[term, "Std. Error"])
+  tibble(
+    or = exp(est),
+    lower_ci = exp(est - 1.96 * se),
+    upper_ci = exp(est + 1.96 * se),
+    p_value = unname(co[term, "Pr(>|z|)"])
+  )
+}
+
+logit_formula <- as.formula(
+  paste0(EVENT_COL, " ~ ", paste(c("carrier","APOE_Status", SEX_COL, PC_COLS), collapse = " + "))
+)
+
+fit_one_variant_logit <- function(v) {
+  vd <- filtered_data %>% filter(.data[[VARIANT_COL]] == v)
+
+  needed <- c(EVENT_COL, "carrier", "APOE_Status", SEX_COL, PC_COLS)
+  vd2 <- vd %>% filter(if_all(all_of(needed), ~ !is.na(.)))
+
+  n_total <- nrow(vd)
+  n_used  <- nrow(vd2)
+  n_carriers <- sum(vd$carrier == 1L, na.rm = TRUE)
+  n_cases <- sum(vd[[EVENT_COL]] == 1L, na.rm = TRUE)
+
+  fit <- safe_glm(logit_formula, vd2)
+  if (inherits(fit, "error")) {
+    return(tibble(
+      Variant = v, n_total = n_total, n_used = n_used, n_carriers = n_carriers, n_cases = n_cases,
+      or = NA_real_, lower_ci = NA_real_, upper_ci = NA_real_, p_value = NA_real_,
+      fit_error = as.character(fit$message)
+    ))
+  }
+
+  carrier_row <- extract_or_ci(fit, "carrier")
+  tibble(
+    Variant = v, n_total = n_total, n_used = n_used, n_carriers = n_carriers, n_cases = n_cases,
+    or = carrier_row$or, lower_ci = carrier_row$lower_ci, upper_ci = carrier_row$upper_ci,
+    p_value = carrier_row$p_value,
+    fit_error = NA_character_
+  )
+}
+
+logit_results <- map_dfr(variants_to_test, fit_one_variant_logit) %>%
+  mutate(
+    p_fdr = p.adjust(p_value, method = "fdr"),
+    sig_fdr_0.05 = !is.na(p_fdr) & p_fdr < 0.05
+  ) %>%
+  arrange(p_fdr, p_value)
+
+write_csv(logit_results, file.path(OUT_DIR, "logit_variant_effects_apoe_adjusted.csv"))
+
+###############################################################################
+# 6) SUMMARY TABLES FOR “SIGNIFICANT VARIANTS” + EFFECT SIZE COMPARISON
+###############################################################################
+
+sig_cox <- cox_results %>%
+  filter(sig_fdr_0.05) %>%
+  transmute(
+    Variant,
+    model = "Cox (APOE-adjusted)",
+    effect = hr,
+    lower_ci,
+    upper_ci,
+    p_value,
+    p_fdr,
+    n_used,
+    n_carriers,
+    n_events,
+    n_events_carriers,
+    interaction_p_e4,
+    interaction_p_factor
+  )
+
+sig_logit <- logit_results %>%
+  filter(sig_fdr_0.05) %>%
+  transmute(
+    Variant,
+    model = "Logistic (APOE-adjusted)",
+    effect = or,
+    lower_ci,
+    upper_ci,
+    p_value,
+    p_fdr,
+    n_used,
+    n_carriers,
+    n_events = n_cases,
+    n_events_carriers = NA_integer_,
+    interaction_p_e4 = NA_real_,
+    interaction_p_factor = NA_real_
+  )
+
+sig_combined <- bind_rows(sig_cox, sig_logit) %>%
+  arrange(model, p_fdr, p_value)
+
+write_csv(sig_combined, file.path(OUT_DIR, "significant_variants_effect_sizes_apoe_adjusted.csv"))
+```
+# IMPORTANT: Verify TIME_COL is age-at-diagnosis for cases and age-at-censoring for controls.
+# If TIME_COL is baseline age, Cox results will be invalid.
